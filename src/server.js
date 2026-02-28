@@ -75,6 +75,7 @@ const OPENCLAW_ENTRY =
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "";
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
   10,
@@ -449,7 +450,33 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
         { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
       ],
     },
+  ,
+    {
+      value: "ollama",
+      label: "Ollama",
+      hint: "Local / self-hosted",
+      options: [
+        { value: "ollama", label: "Ollama (OpenAI-compatible)" },
+      ],
+    },
   ];
+
+  // Fetch available Ollama models if OLLAMA_BASE_URL is configured
+  let ollamaModels = [];
+  if (OLLAMA_BASE_URL) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const r = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (r.ok) {
+        const data = await r.json();
+        ollamaModels = (data.models || []).map((m) => m.name);
+      }
+    } catch (err) {
+      console.warn(`[ollama] failed to fetch models: ${err.message}`);
+    }
+  }
 
   res.json({
     configured: isConfigured(),
@@ -458,6 +485,8 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     channelsAddHelp: channelsHelp,
     authGroups,
     tuiEnabled: ENABLE_WEB_TUI,
+    ollamaBaseUrl: OLLAMA_BASE_URL || null,
+    ollamaModels,
   });
 });
 
@@ -501,9 +530,19 @@ function buildOnboardArgs(payload) {
       "synthetic-api-key": "--synthetic-api-key",
       "opencode-zen": "--opencode-zen-api-key",
     };
-    const flag = map[payload.authChoice];
-    if (flag && secret) {
-      args.push(flag, secret);
+
+    // Ollama uses OpenAI-compatible API - pass the base URL as openai api base
+    if (payload.authChoice === "ollama") {
+      const ollamaUrl = (payload.ollamaUrl || process.env.OLLAMA_BASE_URL || "").trim();
+      if (ollamaUrl) {
+        args.push("--openai-api-key", "ollama");
+        args.push("--openai-api-base", `${ollamaUrl}/v1`);
+      }
+    } else {
+      const flag = map[payload.authChoice];
+      if (flag && secret) {
+        args.push(flag, secret);
+      }
     }
 
   }
@@ -551,6 +590,7 @@ const VALID_AUTH_CHOICES = [
   "copilot-proxy",
   "synthetic-api-key",
   "opencode-zen",
+  "ollama",
 ];
 
 function validatePayload(payload) {
@@ -564,6 +604,7 @@ if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     "slackAppToken",
     "authSecret",
     "model",
+    "ollamaUrl",
   ];
   for (const field of stringFields) {
     if (payload[field] !== undefined && typeof payload[field] !== "string") {

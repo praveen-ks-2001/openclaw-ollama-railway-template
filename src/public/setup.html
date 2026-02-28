@@ -66,6 +66,10 @@
         authChoices: [],
         selectedAuth: '',
         authSecret: '',
+        ollamaUrl: '',
+        ollamaModels: [],
+        selectedOllamaModel: '',
+        ollamaBaseUrlFromEnv: null,
         telegramToken: '',
         discordToken: '',
         slackBotToken: '',
@@ -113,6 +117,11 @@
             this.tuiEnabled = j.tuiEnabled || false;
             this.status = j.configured ? 'Configured - open /openclaw' : 'Not configured - run setup below';
             this.authGroups = j.authGroups || [];
+            this.ollamaBaseUrlFromEnv = j.ollamaBaseUrl || null;
+            this.ollamaModels = j.ollamaModels || [];
+            if (this.ollamaModels.length > 0) {
+              this.selectedOllamaModel = this.ollamaModels[0];
+            }
             if (this.authGroups.length > 0) {
               this.selectedGroup = this.authGroups[0].value;
               this.updateAuthChoices();
@@ -147,7 +156,10 @@
           const payload = {
             authChoice: this.selectedAuth,
             authSecret: this.authSecret,
-            model: this.model,
+            ollamaUrl: this.ollamaUrl || (this.ollamaBaseUrlFromEnv || ''),
+            model: this.selectedGroup === 'ollama'
+              ? ('openai/' + (this.selectedOllamaModel || this.model).replace(/^openai\//, ''))
+              : this.model,
             telegramToken: this.telegramToken,
             discordToken: this.discordToken,
             slackBotToken: this.slackBotToken,
@@ -518,14 +530,52 @@
                       </template>
                     </select>
                   </div>
-                  <div>
+                  <!-- Standard API key field (hidden for Ollama) -->
+                  <div x-show="selectedGroup !== 'ollama'">
                     <label
                       class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">API
                       Key / Token</label>
                     <input x-model="authSecret" type="password" placeholder="Paste your API key or token"
                       class="input-field" />
                   </div>
-                  <div>
+
+                  <!-- Ollama-specific fields -->
+                  <template x-if="selectedGroup === 'ollama'">
+                    <div class="space-y-4">
+                      <div>
+                        <label class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Ollama Base URL</label>
+                        <input x-model="ollamaUrl"
+                          :placeholder="ollamaBaseUrlFromEnv ? 'Pre-filled from OLLAMA_BASE_URL env var' : 'e.g. http://ollama-service:11434'"
+                          type="text" class="input-field" />
+                        <p x-show="ollamaBaseUrlFromEnv" class="text-xs text-[var(--color-success)] mt-1.5">
+                          ✓ OLLAMA_BASE_URL is set (<span x-text="ollamaBaseUrlFromEnv"></span>)
+                        </p>
+                        <p x-show="!ollamaBaseUrlFromEnv" class="text-xs text-[var(--color-text-muted)] mt-1.5">
+                          Set <code class="bg-[var(--color-surface-overlay)] px-1 py-0.5 rounded">OLLAMA_BASE_URL</code> env var in Railway to skip this field
+                        </p>
+                      </div>
+                      <div>
+                        <label class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Available Models</label>
+                        <template x-if="ollamaModels.length > 0">
+                          <div class="space-y-2">
+                            <select x-model="selectedOllamaModel" class="input-field">
+                              <template x-for="m in ollamaModels" :key="m">
+                                <option :value="m" x-text="m"></option>
+                              </template>
+                            </select>
+                            <p class="text-xs text-[var(--color-success)]">✓ <span x-text="ollamaModels.length"></span> model(s) fetched from Ollama</p>
+                          </div>
+                        </template>
+                        <template x-if="ollamaModels.length === 0">
+                          <div class="space-y-2">
+                            <p class="text-xs text-[var(--color-warning)]">⚠ No models found — make sure OLLAMA_BASE_URL is correct and you have pulled models via <code class="bg-[var(--color-surface-overlay)] px-1 py-0.5 rounded">ollama pull</code></p>
+                            <input x-model="model" type="text" placeholder="Manually enter model name (e.g. llama3.2)" class="input-field" />
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                  <div x-show="selectedGroup !== 'ollama'">
                     <label
                       class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Model</label>
                     <input x-model="model" type="text" placeholder="e.g. openai/gpt-4.1, anthropic/claude-sonnet-4"
