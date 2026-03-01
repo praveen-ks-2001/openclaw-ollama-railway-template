@@ -803,32 +803,118 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           extra += cleanOutput.substring(0, 2000) + "\n";
         }
 
-        // Post-fix: ensure baseUrl points to remote Ollama, not localhost
+        // After ollama launch, ensure models.providers.ollama exists with correct config.
+        // ollama launch uses implicit discovery (localhost) which fails for remote Ollama,
+        // so we build the explicit provider config ourselves.
         try {
           const cfgPath = configPath();
           const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-          const ollamaCfg = cfg?.models?.providers?.ollama;
-          if (ollamaCfg) {
-            let changed = false;
+
+          if (!cfg.models) cfg.models = {};
+          if (!cfg.models.providers) cfg.models.providers = {};
+
+          let ollamaCfg = cfg.models.providers.ollama;
+          const needsCreation = !ollamaCfg || !Array.isArray(ollamaCfg.models);
+
+          if (needsCreation) {
+            extra += `[config] Creating explicit models.providers.ollama config...\n`;
+
+            // Fetch models from the remote Ollama instance
+            let ollamaModels = [];
+            try {
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), 15_000);
+              const tagsRes = await fetch(`${ollamaBaseUrl}/api/tags`, { signal: controller.signal });
+              clearTimeout(timeout);
+              if (tagsRes.ok) {
+                const tagsData = await tagsRes.json();
+                const rawModels = tagsData.models || [];
+                extra += `[config] Fetched ${rawModels.length} model(s) from Ollama\n`;
+
+                for (const m of rawModels) {
+                  let contextWindow = 8192;
+                  try {
+                    const sc = new AbortController();
+                    const st = setTimeout(() => sc.abort(), 10_000);
+                    const sr = await fetch(`${ollamaBaseUrl}/api/show`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ name: m.name }),
+                      signal: sc.signal,
+                    });
+                    clearTimeout(st);
+                    if (sr.ok) {
+                      const sd = await sr.json();
+                      for (const [k, v] of Object.entries(sd.model_info || {})) {
+                        if (k.endsWith(".context_length") && typeof v === "number") {
+                          contextWindow = v;
+                          break;
+                        }
+                      }
+                    }
+                  } catch { /* use default */ }
+
+                  ollamaModels.push({
+                    id: m.name,
+                    name: m.name,
+                    reasoning: false,
+                    input: ["text"],
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    contextWindow,
+                    maxTokens: contextWindow * 10,
+                  });
+                }
+              }
+            } catch (err) {
+              extra += `[config] Could not fetch models: ${err.message}\n`;
+            }
+
+            // Fallback: use the selected model if fetch failed
+            if (ollamaModels.length === 0 && modelName) {
+              extra += `[config] Using selected model as fallback: ${modelName}\n`;
+              ollamaModels.push({
+                id: modelName,
+                name: modelName,
+                reasoning: false,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 32768,
+                maxTokens: 32768 * 10,
+              });
+            }
+
+            cfg.models.providers.ollama = {
+              baseUrl: ollamaBaseUrl,
+              api: "ollama",
+              apiKey: "ollama-local",
+              models: ollamaModels,
+            };
+            ollamaCfg = cfg.models.providers.ollama;
+            extra += `[config] Injected ollama provider with ${ollamaModels.length} model(s)\n`;
+          } else {
+            // Fix baseUrl if it points to localhost
             if (!ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost")) {
               ollamaCfg.baseUrl = ollamaBaseUrl;
-              changed = true;
               extra += `[config] Fixed ollama baseUrl → ${ollamaBaseUrl}\n`;
             }
             if (!ollamaCfg.api) {
               ollamaCfg.api = "ollama";
-              changed = true;
-              extra += `[config] Set ollama api → "ollama"\n`;
             }
-            if (changed) {
-              fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
-            }
-            extra += `[config] Final: baseUrl=${ollamaCfg.baseUrl}, api=${ollamaCfg.api}\n`;
-          } else {
-            extra += `[config] Warning: models.providers.ollama not found after ollama launch\n`;
           }
+
+          // Also set the default model
+          if (modelName) {
+            if (!cfg.agents) cfg.agents = {};
+            if (!cfg.agents.defaults) cfg.agents.defaults = {};
+            if (!cfg.agents.defaults.model) cfg.agents.defaults.model = {};
+            cfg.agents.defaults.model.primary = `ollama/${modelName}`;
+            extra += `[config] Set default model → ollama/${modelName}\n`;
+          }
+
+          fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+          extra += `[config] Final: baseUrl=${ollamaCfg.baseUrl}, api=${ollamaCfg.api}, models=${ollamaCfg.models?.length || 0}\n`;
         } catch (err) {
-          extra += `[config] Failed to verify config: ${err.message}\n`;
+          extra += `[config] Failed to configure: ${err.message}\n`;
         }
       }
 
