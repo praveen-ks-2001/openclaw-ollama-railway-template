@@ -520,7 +520,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   if (ollamaUrlIsTemplate) {
     // The env var contains an unresolved Railway template literal — warn clearly
     ollamaError = `OLLAMA_BASE_URL contains an unresolved Railway template variable: "${_rawOllamaBaseUrl}". ` +
-      `Railway does NOT resolve ${{...}} syntax in env vars read by Node.js. ` +
+      `Railway does NOT resolve \${{...}} syntax in env vars read by Node.js. ` +
       `Set OLLAMA_BASE_URL to a literal URL, e.g. http://qwen3.railway.internal:11434 ` +
       `(replace "qwen3" with your Ollama service's RAILWAY_PRIVATE_DOMAIN value).`;
     console.warn(`[ollama] ${ollamaError}`);
