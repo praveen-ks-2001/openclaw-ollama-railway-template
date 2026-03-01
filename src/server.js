@@ -719,63 +719,88 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (payload.authChoice === "ollama-local") {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
         const modelName = payload.model?.trim()?.replace(/^ollama\//, "") || "";
-        extra += `\n[setup] Configuring Ollama provider via ollama launch openclaw...\n`;
+        extra += `\n[setup] Configuring Ollama via ollama launch openclaw (PTY)...\n`;
         extra += `[ollama] OLLAMA_HOST=${ollamaBaseUrl}\n`;
         extra += `[ollama] Model: ${modelName}\n`;
 
-        // First, stop any running gateway so ollama launch can configure cleanly
+        // Stop any running gateway first (required by ollama launch)
         try {
           await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
           extra += `[ollama] Stopped existing gateway\n`;
-        } catch { /* no gateway running, that's fine */ }
+        } catch { /* no gateway running */ }
 
-        // Run: ollama launch openclaw --model <model>
-        // WITHOUT --config flag — this does FULL provider registration.
-        // This command starts gateway/TUI and blocks, so we use a timeout.
+        // Use node-pty to spawn ollama launch openclaw in a pseudo-terminal.
+        // This is needed because the command has interactive prompts:
+        //   1. Security notice → "Proceed?" (Yes/No)
+        //   2. Config modification → "Proceed?" (Yes/No)
+        // We auto-press Enter to accept the default "Yes" for each prompt.
         const launchArgs = ["launch", "openclaw"];
         if (modelName) {
           launchArgs.push("--model", modelName);
         }
-        extra += `[ollama] Running: ollama ${launchArgs.join(" ")}\n`;
+        extra += `[ollama] Running via PTY: ollama ${launchArgs.join(" ")}\n`;
 
         const launchResult = await new Promise((resolve) => {
           let out = "";
-          const proc = childProcess.spawn("ollama", launchArgs, {
+          let configWritten = false;
+
+          const ptyProc = pty.spawn("ollama", launchArgs, {
+            name: "xterm-256color",
+            cols: 120,
+            rows: 40,
+            cwd: WORKSPACE_DIR,
             env: {
               ...process.env,
               OLLAMA_HOST: ollamaBaseUrl,
               OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "ollama-local",
               OPENCLAW_STATE_DIR: STATE_DIR,
               OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+              TERM: "xterm-256color",
             },
-            stdio: "pipe",
           });
 
-          proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
-          proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
+          ptyProc.onData((data) => {
+            out += data;
+            const lower = data.toLowerCase();
 
-          // Give it up to 30s to configure, then kill
+            // Auto-answer interactive prompts by pressing Enter (selects default "Yes")
+            if (lower.includes("proceed?") || lower.includes("download") || lower.includes("security")) {
+              setTimeout(() => {
+                try { ptyProc.write("\r"); } catch { }
+              }, 500);
+            }
+
+            // Detect when config has been modified
+            if (data.includes("Updated") && data.includes("openclaw.json")) {
+              configWritten = true;
+            }
+
+            // Detect when gateway starts (we don't need it, we'll start our own)
+            if (data.includes("gateway") && data.includes("start")) {
+              // Give it a moment to finish writing config, then kill
+              setTimeout(() => {
+                try { ptyProc.kill(); } catch { }
+              }, 3000);
+            }
+          });
+
+          // Max timeout: 45 seconds
           const timer = setTimeout(() => {
-            proc.kill("SIGTERM");
-            setTimeout(() => {
-              try { proc.kill("SIGKILL"); } catch { }
-            }, 2000);
-          }, 30_000);
+            try { ptyProc.kill(); } catch { }
+          }, 45_000);
 
-          proc.on("error", (err) => {
+          ptyProc.onExit(({ exitCode }) => {
             clearTimeout(timer);
-            resolve({ code: 127, output: out + `\n[spawn error] ${err.message}` });
-          });
-
-          proc.on("exit", (code) => {
-            clearTimeout(timer);
-            resolve({ code: code ?? 1, output: out });
+            resolve({ code: exitCode ?? 0, output: out, configWritten });
           });
         });
 
+        // Strip ANSI escape codes for clean log output
+        const cleanOutput = launchResult.output.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "").trim();
         extra += `[ollama] exit=${launchResult.code}\n`;
-        if (launchResult.output) {
-          extra += launchResult.output + "\n";
+        if (cleanOutput) {
+          // Only log the first 2000 chars to avoid flooding
+          extra += cleanOutput.substring(0, 2000) + "\n";
         }
 
         // Post-fix: ensure baseUrl points to remote Ollama, not localhost
@@ -785,8 +810,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           const ollamaCfg = cfg?.models?.providers?.ollama;
           if (ollamaCfg) {
             let changed = false;
-            const needsBaseUrlFix = !ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost");
-            if (needsBaseUrlFix) {
+            if (!ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost")) {
               ollamaCfg.baseUrl = ollamaBaseUrl;
               changed = true;
               extra += `[config] Fixed ollama baseUrl → ${ollamaBaseUrl}\n`;
