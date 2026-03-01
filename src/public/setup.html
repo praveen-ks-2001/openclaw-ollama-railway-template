@@ -251,6 +251,24 @@
           }
         },
 
+        async debugOllama() {
+          this.log = 'Running Ollama diagnostics...\n';
+          this.loading = true;
+          try {
+            const res = await fetch('/setup/api/debug-ollama', { credentials: 'same-origin' });
+            const j = await res.json();
+            this.log += '=== Environment ===\n';
+            this.log += JSON.stringify(j.env, null, 2) + '\n\n';
+            this.log += '=== Connectivity ===\n';
+            this.log += JSON.stringify(j.connectivity, null, 2) + '\n\n';
+            this.log += '=== Advice ===\n' + j.advice + '\n';
+          } catch (e) {
+            this.log += 'Error: ' + String(e) + '\n';
+          } finally {
+            this.loading = false;
+          }
+        },
+
         async applyOllama() {
           this.log = 'Re-applying Ollama config...\n';
           this.loading = true;
@@ -807,14 +825,31 @@
                         <p class="text-xs text-[var(--color-text-muted)] mb-3">
                           If models aren't showing in OpenClaw, click below to re-write the provider config and restart the gateway.
                         </p>
-                        <button @click="applyOllama()" :disabled="loading" class="btn btn-secondary w-full text-sm">
-                          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                          </svg>
-                          <span x-show="!loading">Re-apply Ollama Config</span>
-                          <span x-show="loading">Applying...</span>
-                        </button>
+                        <!-- Template var warning in post-setup too -->
+                        <template x-if="ollamaUrlIsTemplate">
+                          <div class="rounded-lg p-2.5 text-xs bg-[#2d1a00] border border-[var(--color-danger)] text-[var(--color-danger)] mb-2">
+                            ⛔ OLLAMA_BASE_URL uses Railway template syntax &mdash; change it to a literal URL, e.g:<br>
+                            <code class="block font-mono mt-1 bg-black/30 px-1.5 py-1 rounded select-all">http://qwen3.railway.internal:11434</code>
+                          </div>
+                        </template>
+                        <div class="flex gap-2">
+                          <button @click="applyOllama()" :disabled="loading" class="btn btn-secondary flex-1 text-sm">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            <span x-show="!loading">Re-apply</span>
+                            <span x-show="loading">...</span>
+                          </button>
+                          <button @click="debugOllama()" :disabled="loading" class="btn btn-secondary flex-1 text-sm">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            <span x-show="!loading">Diagnose</span>
+                            <span x-show="loading">...</span>
+                          </button>
+                        </div>
                       </div>
                     </template>
 
