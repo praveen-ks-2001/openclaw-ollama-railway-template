@@ -10,11 +10,7 @@ RUN apt-get update \
     python3 \
     build-essential \
     zip \
-    zstd \
   && rm -rf /var/lib/apt/lists/*
-
-# Install ollama CLI (needed for `ollama launch openclaw --config`)
-RUN curl -fsSL https://ollama.com/install.sh | sh
 
 RUN npm install -g openclaw@latest
 
