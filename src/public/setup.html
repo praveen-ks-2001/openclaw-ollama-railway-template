@@ -251,6 +251,30 @@
           }
         },
 
+        async applyOllama() {
+          this.log = 'Re-applying Ollama config...\n';
+          this.loading = true;
+          try {
+            const res = await fetch('/setup/api/apply-ollama', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({}),
+            });
+            const j = await res.json();
+            this.log += (j.output || JSON.stringify(j, null, 2));
+            if (j.ok) {
+              this.log += '\n✓ Ollama config applied. The gateway has been restarted.\n';
+            } else {
+              this.log += '\n✗ Failed. See output above.\n';
+            }
+          } catch (e) {
+            this.log += '\nError: ' + String(e) + '\n';
+          } finally {
+            this.loading = false;
+          }
+        },
+
         async runDoctor() {
           this.log = 'Running doctor...\n';
           this.loading = true;
@@ -769,6 +793,31 @@
                         <span x-show="exporting">Exporting...</span>
                       </button>
                     </div>
+
+                    <!-- Ollama: re-apply config button (shown when OLLAMA_BASE_URL is set) -->
+                    <template x-if="ollamaConfigured">
+                      <div class="mt-4 pt-4 border-t border-[var(--color-border-muted)]">
+                        <div class="flex items-center gap-2 mb-2">
+                          <span class="text-sm font-medium text-[var(--color-text-primary)]">Ollama Provider</span>
+                          <span class="text-[10px] uppercase tracking-wide font-semibold text-[var(--color-success)] bg-[#0d2818] border border-[var(--color-success)]/30 px-2 py-0.5 rounded">Active</span>
+                        </div>
+                        <p class="text-xs text-[var(--color-text-secondary)] mb-2">
+                          URL: <code class="bg-[var(--color-surface-overlay)] px-1 rounded font-mono text-[11px]" x-text="ollamaBaseUrl"></code>
+                        </p>
+                        <p class="text-xs text-[var(--color-text-muted)] mb-3">
+                          If models aren't showing in OpenClaw, click below to re-write the provider config and restart the gateway.
+                        </p>
+                        <button @click="applyOllama()" :disabled="loading" class="btn btn-secondary w-full text-sm">
+                          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                          </svg>
+                          <span x-show="!loading">Re-apply Ollama Config</span>
+                          <span x-show="loading">Applying...</span>
+                        </button>
+                      </div>
+                    </template>
+
                   </section>
 
                   <!-- Logs -->

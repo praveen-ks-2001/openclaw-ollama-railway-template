@@ -177,13 +177,26 @@ async function startGateway() {
     "--allow-unconfigured",
   ];
 
+  // Build the env for the gateway process.
+  // OLLAMA_API_KEY must be explicitly present — OpenClaw checks this env var
+  // directly to register the Ollama provider at startup. Without it the
+  // provider is not registered, even if baseUrl is set in the config file.
+  const gatewayEnv = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: STATE_DIR,
+    OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+  };
+  if (OLLAMA_API_KEY) {
+    gatewayEnv.OLLAMA_API_KEY = OLLAMA_API_KEY;
+  }
+  if (OLLAMA_BASE_URL) {
+    gatewayEnv.OLLAMA_BASE_URL = OLLAMA_BASE_URL;
+    gatewayEnv.OLLAMA_HOST     = OLLAMA_BASE_URL; // some builds read OLLAMA_HOST
+  }
+
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
-    env: {
-      ...process.env,
-      OPENCLAW_STATE_DIR: STATE_DIR,
-      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-    },
+    env: gatewayEnv,
   });
 
   const safeArgs = args.map((arg, i) =>
@@ -562,13 +575,21 @@ function buildOnboardArgs(payload) {
 
 function runCmd(cmd, args, opts = {}) {
   return new Promise((resolve) => {
+    const runEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+    };
+    if (OLLAMA_API_KEY) {
+      runEnv.OLLAMA_API_KEY = OLLAMA_API_KEY;
+    }
+    if (OLLAMA_BASE_URL) {
+      runEnv.OLLAMA_BASE_URL = OLLAMA_BASE_URL;
+      runEnv.OLLAMA_HOST     = OLLAMA_BASE_URL;
+    }
     const proc = childProcess.spawn(cmd, args, {
       ...opts,
-      env: {
-        ...process.env,
-        OPENCLAW_STATE_DIR: STATE_DIR,
-        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-      },
+      env: runEnv,
     });
 
     let out = "";
@@ -690,42 +711,43 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
       // ── Ollama provider post-onboard configuration ───────────────────────
       if (payload.authChoice === "ollama") {
-        const ollamaUrl = (OLLAMA_BASE_URL || "").trim();
-        const ollamaKey = (OLLAMA_API_KEY || "ollama-local").trim();
+        const ollamaUrl   = (OLLAMA_BASE_URL || "").trim();
+        const ollamaKey   = (OLLAMA_API_KEY  || "ollama-local").trim();
         const ollamaModel = (payload.ollamaModel || payload.model || "").trim();
 
         extra += `\n[ollama] Configuring native Ollama provider...\n`;
+        extra += `[ollama] baseUrl=${ollamaUrl || "(none)"} apiKey=${ollamaKey ? "(set)" : "(missing)"}\n`;
 
-        // Set the API key (any non-empty value works)
+        // Write the full ollama provider block as a single JSON object.
+        // This is more reliable than dot-notation set for nested objects.
+        const ollamaProviderCfg = {
+          apiKey:  ollamaKey,
+          api:     "ollama",   // forces native /api/chat — NOT /v1
+          ...(ollamaUrl ? { baseUrl: ollamaUrl } : {}),
+        };
         const r1 = await runCmd(OPENCLAW_NODE, clawArgs([
-          "config", "set", "models.providers.ollama.apiKey", ollamaKey,
+          "config", "set", "--json",
+          "models.providers.ollama",
+          JSON.stringify(ollamaProviderCfg),
         ]));
-        extra += `[ollama] set apiKey exit=${r1.code}\n`;
+        extra += `[ollama] wrote provider config exit=${r1.code}\n`;
+        if (r1.output) extra += r1.output + "\n";
 
-        // Set the base URL (no /v1 suffix — native Ollama API)
-        if (ollamaUrl) {
-          const r2 = await runCmd(OPENCLAW_NODE, clawArgs([
-            "config", "set", "models.providers.ollama.baseUrl", ollamaUrl,
-          ]));
-          extra += `[ollama] set baseUrl=${ollamaUrl} exit=${r2.code}\n`;
-        }
-
-        // Explicitly set api: "ollama" so OpenClaw uses the native /api/chat
-        // (not the OpenAI-compat /v1 path, which breaks tool calling)
-        const r3 = await runCmd(OPENCLAW_NODE, clawArgs([
-          "config", "set", "models.providers.ollama.api", "ollama",
+        // Verify what was written
+        const verify = await runCmd(OPENCLAW_NODE, clawArgs([
+          "config", "get", "models.providers.ollama",
         ]));
-        extra += `[ollama] set api=ollama exit=${r3.code}\n`;
+        extra += `[ollama] verify exit=${verify.code}: ${verify.output?.trim() || "(empty)"}\n`;
 
-        // Set the model in agents.defaults if provided
+        // Set the default model
         if (ollamaModel) {
           const fullModel = ollamaModel.startsWith("ollama/")
             ? ollamaModel
             : `ollama/${ollamaModel}`;
-          const r4 = await runCmd(OPENCLAW_NODE, clawArgs([
+          const r2 = await runCmd(OPENCLAW_NODE, clawArgs([
             "models", "set", fullModel,
           ]));
-          extra += `[ollama] set default model=${fullModel} exit=${r4.code}\n${r4.output || ""}`;
+          extra += `[ollama] set default model=${fullModel} exit=${r2.code}\n${r2.output || ""}`;
         }
       } else if (payload.model?.trim()) {
       // ── Standard model selection ─────────────────────────────────────────
@@ -844,6 +866,47 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   return res
     .status(r.code === 0 ? 200 : 500)
     .json({ ok: r.code === 0, output: r.output });
+});
+
+// Re-apply Ollama provider config to an existing installation.
+// Useful when OLLAMA_BASE_URL was added/changed after initial setup.
+app.post("/setup/api/apply-ollama", requireSetupAuth, async (_req, res) => {
+  if (!isConfigured()) {
+    return res.status(400).json({ ok: false, output: "Not yet configured. Run setup first.\n" });
+  }
+
+  const ollamaUrl = OLLAMA_BASE_URL;
+  const ollamaKey = OLLAMA_API_KEY || "ollama-local";
+
+  if (!ollamaUrl) {
+    return res.status(400).json({
+      ok: false,
+      output: "OLLAMA_BASE_URL is not set. Add it to Railway Variables and redeploy.\n",
+    });
+  }
+
+  let out = `[apply-ollama] baseUrl=${ollamaUrl} apiKey=${ollamaKey ? "(set)" : "(missing)"}\n`;
+
+  const ollamaProviderCfg = { apiKey: ollamaKey, api: "ollama", baseUrl: ollamaUrl };
+  const r1 = await runCmd(OPENCLAW_NODE, clawArgs([
+    "config", "set", "--json", "models.providers.ollama", JSON.stringify(ollamaProviderCfg),
+  ]));
+  out += `[apply-ollama] wrote provider config exit=${r1.code}\n${r1.output || ""}`;
+
+  const verify = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", "models.providers.ollama"]));
+  out += `[apply-ollama] verify: ${verify.output?.trim() || "(empty)"}\n`;
+
+  if (r1.code === 0) {
+    out += "\n[apply-ollama] Restarting gateway to pick up new config...\n";
+    try {
+      await restartGateway();
+      out += "[apply-ollama] Gateway restarted.\n";
+    } catch (err) {
+      out += `[apply-ollama] Gateway restart failed: ${err.message}\n`;
+    }
+  }
+
+  return res.status(r1.code === 0 ? 200 : 500).json({ ok: r1.code === 0, output: out });
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
