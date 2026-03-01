@@ -577,6 +577,7 @@ function runCmd(cmd, args, opts = {}) {
         ...process.env,
         OPENCLAW_STATE_DIR: STATE_DIR,
         OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+        ...(opts.env || {}),
       },
     });
 
@@ -708,104 +709,37 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       // Configure Ollama provider if selected
       if (payload.authChoice === "ollama-local") {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
-        extra += `\n[setup] Configuring Ollama provider (baseUrl=${ollamaBaseUrl})...\n`;
+        extra += `\n[setup] Configuring Ollama provider via ollama launch openclaw...\n`;
 
-        // Ensure OLLAMA_API_KEY is set for child processes
-        process.env.OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "ollama-local";
+        // Set env vars for ollama CLI: OLLAMA_HOST points the
+        // CLI at the remote Ollama server for model discovery
+        const ollamaEnv = {
+          OLLAMA_HOST: ollamaBaseUrl,
+          OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "ollama-local",
+        };
 
-        // For remote Ollama (Railway), we must build a FULL explicit provider config
-        // including a models array — OpenClaw's schema requires it.
-        // Step 1: Fetch available models from Ollama /api/tags
-        let ollamaModels = [];
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15_000);
-          const tagsRes = await fetch(`${ollamaBaseUrl}/api/tags`, { signal: controller.signal });
-          clearTimeout(timeout);
-          if (tagsRes.ok) {
-            const tagsData = await tagsRes.json();
-            const rawModels = tagsData.models || [];
-            extra += `[ollama] Found ${rawModels.length} model(s) from /api/tags\n`;
+        // Use the selected model name (strip ollama/ prefix for ollama CLI)
+        const modelName = payload.model?.trim()?.replace(/^ollama\//, "") || "";
 
-            // Step 2: For each model, try /api/show to get details
-            for (const m of rawModels) {
-              let contextWindow = 8192;
-              try {
-                const showCtrl = new AbortController();
-                const showTimeout = setTimeout(() => showCtrl.abort(), 10_000);
-                const showRes = await fetch(`${ollamaBaseUrl}/api/show`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ name: m.name }),
-                  signal: showCtrl.signal,
-                });
-                clearTimeout(showTimeout);
-                if (showRes.ok) {
-                  const showData = await showRes.json();
-                  // Extract context_length from model_info
-                  const modelInfo = showData.model_info || {};
-                  for (const [key, val] of Object.entries(modelInfo)) {
-                    if (key.endsWith(".context_length") && typeof val === "number") {
-                      contextWindow = val;
-                      break;
-                    }
-                  }
-                }
-              } catch { /* use default contextWindow */ }
-
-              ollamaModels.push({
-                id: m.name,
-                name: m.name,
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow,
-                maxTokens: contextWindow * 10,
-              });
-            }
-          } else {
-            extra += `[ollama] /api/tags returned HTTP ${tagsRes.status}\n`;
-          }
-        } catch (err) {
-          extra += `[ollama] Failed to fetch models from ${ollamaBaseUrl}: ${err.message}\n`;
+        // Run: ollama launch openclaw --config --model <model>
+        // --config = configure only, don't start gateway/TUI
+        // OLLAMA_HOST = points at the remote Ollama server
+        const launchArgs = ["launch", "openclaw", "--config"];
+        if (modelName) {
+          launchArgs.push("--model", modelName);
         }
 
-        // If we couldn't fetch models, create an entry for the selected model
-        if (ollamaModels.length === 0 && payload.model?.trim()) {
-          const modelId = payload.model.trim().replace(/^ollama\//, "");
-          extra += `[ollama] Using selected model as fallback: ${modelId}\n`;
-          ollamaModels.push({
-            id: modelId,
-            name: modelId,
-            reasoning: false,
-            input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 8192,
-            maxTokens: 8192 * 10,
-          });
+        extra += `[ollama] Running: ollama ${launchArgs.join(" ")}\n`;
+        extra += `[ollama] OLLAMA_HOST=${ollamaBaseUrl}\n`;
+
+        const launchResult = await runCmd("ollama", launchArgs, { env: ollamaEnv });
+        extra += `[ollama] exit=${launchResult.code}\n`;
+        if (launchResult.output) {
+          extra += launchResult.output;
         }
 
-        // Step 3: Inject full explicit provider config into openclaw.json
-        try {
-          const cfgPath = configPath();
-          const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-
-          if (!cfg.models) cfg.models = {};
-          if (!cfg.models.providers) cfg.models.providers = {};
-          cfg.models.providers.ollama = {
-            baseUrl: ollamaBaseUrl,
-            api: "ollama",
-            apiKey: "ollama-local",
-            models: ollamaModels,
-          };
-
-          fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
-          extra += `[config] models.providers.ollama injected with ${ollamaModels.length} model(s)\n`;
-          for (const m of ollamaModels) {
-            extra += `  - ${m.id} (ctx=${m.contextWindow})\n`;
-          }
-        } catch (err) {
-          extra += `[config] Failed to inject Ollama provider: ${err.message}\n`;
+        if (launchResult.code !== 0) {
+          extra += `[ollama] Warning: ollama launch exited with code ${launchResult.code}\n`;
         }
       }
 
