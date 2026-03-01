@@ -581,7 +581,7 @@ function buildOnboardArgs(payload) {
     "quickstart",
   ];
 
-  if (payload.authChoice) {
+  if (payload.authChoice && payload.authChoice !== "ollama") {
     args.push("--auth-choice", payload.authChoice);
 
     const secret = (payload.authSecret || "").trim();
@@ -601,12 +601,10 @@ function buildOnboardArgs(payload) {
     };
 
     if (payload.authChoice === "ollama") {
-      // Ollama uses its own native provider — OpenClaw activates it via
-      // OLLAMA_API_KEY.  We still need to get past the onboarding flow
-      // which requires an --auth-choice the CLI knows; we pass openai-api-key
-      // with a placeholder value so the config file is created, then the
-      // post-onboard steps configure the real Ollama provider.
-      args.push("--openai-api-key", "placeholder-replaced-by-ollama");
+      // For Ollama: use --auth-choice skip to bypass provider setup during
+      // onboarding (per CLI docs, "skip" is a valid auth-choice value).
+      // The config file gets created, then we configure Ollama via config set.
+      args.push("--auth-choice", "skip");
     } else {
       const flag = map[payload.authChoice];
       if (flag && secret) {
