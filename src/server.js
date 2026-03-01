@@ -1036,7 +1036,7 @@ app.get("/setup/api/debug-ollama", requireSetupAuth, async (_req, res) => {
       models,
     },
     advice: isTemplate
-      ? `Your OLLAMA_BASE_URL uses Railway template syntax (${{...}}) which is NOT resolved by Node.js. ` +
+      ? `Your OLLAMA_BASE_URL uses Railway template syntax (\${{...}}) which is NOT resolved by Node.js. ` +
         `Change it to a literal value. Your Ollama service RAILWAY_PRIVATE_DOMAIN is likely "qwen3.railway.internal". ` +
         `Set: OLLAMA_BASE_URL=http://qwen3.railway.internal:11434`
       : !OLLAMA_BASE_URL
