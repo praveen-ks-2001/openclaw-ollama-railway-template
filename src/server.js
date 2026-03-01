@@ -830,6 +830,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
           if (verify.output?.trim()) extra += verify.output.trim() + "\n";
 
           // ── Step 4: Set the default model ────────────────────────────────
+          // WARNING: `models set` may trigger a config overwrite that resets
+          // baseUrl. We re-apply the provider config AFTER models set.
           const modelToActivate = chosenModel || installedModels[0] || "";
           if (modelToActivate) {
             const fullModel = modelToActivate.startsWith("ollama/")
@@ -838,6 +840,25 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
             const r2 = await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", fullModel]));
             extra += `[ollama] set default model=${fullModel} exit=${r2.code}\n${r2.output || ""}`;
           }
+
+          // ── Step 5: Re-apply provider config after models set ──────────
+          // `models set` triggers a Config overwrite that may reset baseUrl
+          // to localhost (auto-discovery fallback). We must re-write it.
+          extra += `[ollama] Re-applying provider config after models set...\n`;
+          const r3 = await runCmd(OPENCLAW_NODE, clawArgs([
+            "config", "set", "--json",
+            "models.providers.ollama",
+            JSON.stringify(ollamaProviderCfg),
+          ]));
+          extra += `[ollama] re-apply config set exit=${r3.code}\n`;
+          if (r3.output?.trim()) extra += r3.output.trim() + "\n";
+
+          // Final verification — this is what the gateway will actually use
+          const finalVerify = await runCmd(OPENCLAW_NODE, clawArgs([
+            "config", "get", "models.providers.ollama",
+          ]));
+          extra += `[ollama] FINAL config verify exit=${finalVerify.code}\n`;
+          if (finalVerify.output?.trim()) extra += finalVerify.output.trim() + "\n";
         }
       } else if (payload.model?.trim()) {
         // ── Standard model selection ─────────────────────────────────────
