@@ -74,18 +74,11 @@ const OPENCLAW_ENTRY =
   process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
-// Ensure OLLAMA_API_KEY and OLLAMA_HOST are set when OLLAMA_BASE_URL is configured
+// Ensure OLLAMA_API_KEY is set when OLLAMA_BASE_URL is configured
 // OpenClaw needs OLLAMA_API_KEY to register Ollama as a provider
-// OLLAMA_HOST tells the Ollama SDK (and OpenClaw's discovery) where to connect
-if (process.env.OLLAMA_BASE_URL?.trim()) {
-  if (!process.env.OLLAMA_API_KEY) {
-    process.env.OLLAMA_API_KEY = "ollama-local";
-    console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local");
-  }
-  if (!process.env.OLLAMA_HOST) {
-    process.env.OLLAMA_HOST = process.env.OLLAMA_BASE_URL.trim();
-    console.log(`[wrapper] auto-set OLLAMA_HOST=${process.env.OLLAMA_HOST}`);
-  }
+if (process.env.OLLAMA_BASE_URL?.trim() && !process.env.OLLAMA_API_KEY) {
+  process.env.OLLAMA_API_KEY = "ollama-local";
+  console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local");
 }
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
@@ -680,12 +673,82 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
         extra += `\n[setup] Configuring Ollama provider (baseUrl=${ollamaBaseUrl})...\n`;
 
-        // Ensure env vars are set for child processes
+        // Ensure OLLAMA_API_KEY is set for child processes
         process.env.OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "ollama-local";
-        process.env.OLLAMA_HOST = process.env.OLLAMA_HOST || ollamaBaseUrl;
 
-        // Directly edit openclaw.json to inject the Ollama provider config
-        // This bypasses CLI schema validation which incorrectly requires a models array
+        // For remote Ollama (Railway), we must build a FULL explicit provider config
+        // including a models array — OpenClaw's schema requires it.
+        // Step 1: Fetch available models from Ollama /api/tags
+        let ollamaModels = [];
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          const tagsRes = await fetch(`${ollamaBaseUrl}/api/tags`, { signal: controller.signal });
+          clearTimeout(timeout);
+          if (tagsRes.ok) {
+            const tagsData = await tagsRes.json();
+            const rawModels = tagsData.models || [];
+            extra += `[ollama] Found ${rawModels.length} model(s) from /api/tags\n`;
+
+            // Step 2: For each model, try /api/show to get details
+            for (const m of rawModels) {
+              let contextWindow = 8192;
+              try {
+                const showCtrl = new AbortController();
+                const showTimeout = setTimeout(() => showCtrl.abort(), 10_000);
+                const showRes = await fetch(`${ollamaBaseUrl}/api/show`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ name: m.name }),
+                  signal: showCtrl.signal,
+                });
+                clearTimeout(showTimeout);
+                if (showRes.ok) {
+                  const showData = await showRes.json();
+                  // Extract context_length from model_info
+                  const modelInfo = showData.model_info || {};
+                  for (const [key, val] of Object.entries(modelInfo)) {
+                    if (key.endsWith(".context_length") && typeof val === "number") {
+                      contextWindow = val;
+                      break;
+                    }
+                  }
+                }
+              } catch { /* use default contextWindow */ }
+
+              ollamaModels.push({
+                id: m.name,
+                name: m.name,
+                reasoning: false,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow,
+                maxTokens: contextWindow * 10,
+              });
+            }
+          } else {
+            extra += `[ollama] /api/tags returned HTTP ${tagsRes.status}\n`;
+          }
+        } catch (err) {
+          extra += `[ollama] Failed to fetch models from ${ollamaBaseUrl}: ${err.message}\n`;
+        }
+
+        // If we couldn't fetch models, create an entry for the selected model
+        if (ollamaModels.length === 0 && payload.model?.trim()) {
+          const modelId = payload.model.trim().replace(/^ollama\//, "");
+          extra += `[ollama] Using selected model as fallback: ${modelId}\n`;
+          ollamaModels.push({
+            id: modelId,
+            name: modelId,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 8192,
+            maxTokens: 8192 * 10,
+          });
+        }
+
+        // Step 3: Inject full explicit provider config into openclaw.json
         try {
           const cfgPath = configPath();
           const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
@@ -696,10 +759,14 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
             baseUrl: ollamaBaseUrl,
             api: "ollama",
             apiKey: "ollama-local",
+            models: ollamaModels,
           };
 
           fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
-          extra += `[config] models.providers.ollama injected into ${cfgPath}\n`;
+          extra += `[config] models.providers.ollama injected with ${ollamaModels.length} model(s)\n`;
+          for (const m of ollamaModels) {
+            extra += `  - ${m.id} (ctx=${m.contextWindow})\n`;
+          }
         } catch (err) {
           extra += `[config] Failed to inject Ollama provider: ${err.message}\n`;
         }
