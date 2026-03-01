@@ -706,7 +706,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       );
       extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
 
-      if (payload.model?.trim()) {
+      if (payload.model?.trim() && payload.authChoice !== "ollama-local") {
         extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
         const modelResult = await runCmd(
           OPENCLAW_NODE,
@@ -718,63 +718,93 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       // Configure Ollama provider if selected
       if (payload.authChoice === "ollama-local") {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
-        extra += `\n[setup] Configuring Ollama provider via ollama launch openclaw...\n`;
-
-        // Set env vars for ollama CLI: OLLAMA_HOST points the
-        // CLI at the remote Ollama server for model discovery
-        const ollamaEnv = {
-          OLLAMA_HOST: ollamaBaseUrl,
-          OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "ollama-local",
-        };
-
-        // Use the selected model name (strip ollama/ prefix for ollama CLI)
         const modelName = payload.model?.trim()?.replace(/^ollama\//, "") || "";
+        extra += `\n[setup] Configuring Ollama provider via ollama launch openclaw...\n`;
+        extra += `[ollama] OLLAMA_HOST=${ollamaBaseUrl}\n`;
+        extra += `[ollama] Model: ${modelName}\n`;
 
-        // Run: ollama launch openclaw --config --model <model>
-        // --config = configure only, don't start gateway/TUI
-        // OLLAMA_HOST = points at the remote Ollama server
-        const launchArgs = ["launch", "openclaw", "--config"];
+        // First, stop any running gateway so ollama launch can configure cleanly
+        try {
+          await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+          extra += `[ollama] Stopped existing gateway\n`;
+        } catch { /* no gateway running, that's fine */ }
+
+        // Run: ollama launch openclaw --model <model>
+        // WITHOUT --config flag — this does FULL provider registration.
+        // This command starts gateway/TUI and blocks, so we use a timeout.
+        const launchArgs = ["launch", "openclaw"];
         if (modelName) {
           launchArgs.push("--model", modelName);
         }
-
         extra += `[ollama] Running: ollama ${launchArgs.join(" ")}\n`;
-        extra += `[ollama] OLLAMA_HOST=${ollamaBaseUrl}\n`;
 
-        const launchResult = await runCmd("ollama", launchArgs, { env: ollamaEnv });
+        const launchResult = await new Promise((resolve) => {
+          let out = "";
+          const proc = childProcess.spawn("ollama", launchArgs, {
+            env: {
+              ...process.env,
+              OLLAMA_HOST: ollamaBaseUrl,
+              OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "ollama-local",
+              OPENCLAW_STATE_DIR: STATE_DIR,
+              OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+            },
+            stdio: "pipe",
+          });
+
+          proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
+          proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
+
+          // Give it up to 30s to configure, then kill
+          const timer = setTimeout(() => {
+            proc.kill("SIGTERM");
+            setTimeout(() => {
+              try { proc.kill("SIGKILL"); } catch { }
+            }, 2000);
+          }, 30_000);
+
+          proc.on("error", (err) => {
+            clearTimeout(timer);
+            resolve({ code: 127, output: out + `\n[spawn error] ${err.message}` });
+          });
+
+          proc.on("exit", (code) => {
+            clearTimeout(timer);
+            resolve({ code: code ?? 1, output: out });
+          });
+        });
+
         extra += `[ollama] exit=${launchResult.code}\n`;
         if (launchResult.output) {
-          extra += launchResult.output;
+          extra += launchResult.output + "\n";
         }
 
-        if (launchResult.code !== 0) {
-          extra += `[ollama] Warning: ollama launch exited with code ${launchResult.code}\n`;
-        }
-
-        // Ensure the config's baseUrl points to the remote Ollama server.
-        // `ollama launch openclaw --config` may have written localhost as the baseUrl.
+        // Post-fix: ensure baseUrl points to remote Ollama, not localhost
         try {
           const cfgPath = configPath();
           const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
           const ollamaCfg = cfg?.models?.providers?.ollama;
           if (ollamaCfg) {
-            const needsFix = !ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost");
-            if (needsFix) {
+            let changed = false;
+            const needsBaseUrlFix = !ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost");
+            if (needsBaseUrlFix) {
               ollamaCfg.baseUrl = ollamaBaseUrl;
+              changed = true;
               extra += `[config] Fixed ollama baseUrl → ${ollamaBaseUrl}\n`;
             }
-            // Ensure api is set to "ollama" for native tool-calling
             if (!ollamaCfg.api) {
               ollamaCfg.api = "ollama";
-              extra += `[config] Set ollama api → \"ollama\"\n`;
+              changed = true;
+              extra += `[config] Set ollama api → "ollama"\n`;
             }
-            fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
-            extra += `[config] Final ollama provider config: baseUrl=${ollamaCfg.baseUrl}, api=${ollamaCfg.api}\n`;
+            if (changed) {
+              fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+            }
+            extra += `[config] Final: baseUrl=${ollamaCfg.baseUrl}, api=${ollamaCfg.api}\n`;
           } else {
-            extra += `[config] Warning: models.providers.ollama not found in config after ollama launch\n`;
+            extra += `[config] Warning: models.providers.ollama not found after ollama launch\n`;
           }
         } catch (err) {
-          extra += `[config] Failed to verify/fix ollama config: ${err.message}\n`;
+          extra += `[config] Failed to verify config: ${err.message}\n`;
         }
       }
 
