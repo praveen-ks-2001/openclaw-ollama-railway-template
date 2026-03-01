@@ -186,6 +186,19 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Kill any stale gateway process from a previous container run.
+  // On Railway with a persistent volume, the previous container's gateway
+  // may have written a pidfile that points to a now-dead (or still-alive)
+  // process. `openclaw gateway stop` reads that pidfile and cleans up properly.
+  // We do this silently — it's fine if there's nothing to stop.
+  try {
+    const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+    if (stopResult.output?.trim()) {
+      console.log(`[gateway] pre-start cleanup: ${stopResult.output.trim()}`);
+    }
+  } catch {}
+
+  // Remove any stale lock files
   for (const lockPath of [
     path.join(STATE_DIR, "gateway.lock"),
     "/tmp/openclaw-gateway.lock",
@@ -290,29 +303,39 @@ function isGatewayReady() {
 }
 
 async function restartGateway() {
+  manualRestart = true; // suppress auto-restart in exit handler during our controlled restart
+
+  // Step 1: Run `openclaw gateway stop` — this is the CORRECT way to stop the
+  // gateway. It reads the pidfile, kills the right process, and removes the lock.
+  // Simply killing our child process reference leaves stale lock files if the
+  // gateway was previously started by a different process (e.g. from a prior
+  // container run stored on the persistent volume).
+  console.log("[gateway] running `openclaw gateway stop` to release lock...");
+  const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  console.log(`[gateway] gateway stop exit=${stopResult.code}: ${stopResult.output?.trim() || "(no output)"}`);
+
+  // Step 2: Also kill our tracked child process if it's still alive
   if (gatewayProc) {
-    // Wait for the process to actually exit before we try to restart.
-    // If we just kill + sleep(750), the exit handler fires too and schedules
-    // its own restart after 2s — two processes then race for port 18789.
-    // Solution: set a flag the exit handler checks, and wait for the real exit event.
     const proc = gatewayProc;
     const exitPromise = new Promise((resolve) => proc.once("exit", resolve));
-    manualRestart = true; // suppress auto-restart in the exit handler
-    try {
-      proc.kill("SIGTERM");
-    } catch (err) {
-      console.warn(`[gateway] kill error: ${err.message}`);
-    }
-    // Wait up to 5s for clean exit, then SIGKILL
-    const timeout = setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch {}
-    }, 5000);
+    try { proc.kill("SIGTERM"); } catch {}
+    const timeout = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 3000);
     await exitPromise;
     clearTimeout(timeout);
-    // Brief pause to let the OS fully release the port
-    await sleep(500);
-    manualRestart = false;
   }
+
+  // Step 3: Clean up any remaining lock files (belt and suspenders)
+  for (const lockPath of [
+    path.join(STATE_DIR, "gateway.lock"),
+    "/tmp/openclaw-gateway.lock",
+  ]) {
+    try { fs.rmSync(lockPath, { force: true }); } catch {}
+  }
+
+  // Brief pause to ensure port is fully released
+  await sleep(1000);
+  manualRestart = false;
+
   return ensureGatewayRunning();
 }
 
