@@ -74,6 +74,13 @@ const OPENCLAW_ENTRY =
   process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
+// Ensure OLLAMA_API_KEY is set when OLLAMA_BASE_URL is configured
+// OpenClaw needs this env var to register Ollama as a provider
+if (process.env.OLLAMA_BASE_URL?.trim() && !process.env.OLLAMA_API_KEY) {
+  process.env.OLLAMA_API_KEY = "ollama-local";
+  console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local (OLLAMA_BASE_URL is configured)");
+}
+
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
@@ -665,23 +672,31 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (payload.authChoice === "ollama-local") {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
         extra += `\n[setup] Configuring Ollama provider (baseUrl=${ollamaBaseUrl})...\n`;
-        const ollamaConfig = {
-          baseUrl: ollamaBaseUrl,
-          api: "ollama",
-          apiKey: "ollama-local",
-        };
-        const ollamaResult = await runCmd(
+
+        // Ensure OLLAMA_API_KEY is set for discovery
+        if (!process.env.OLLAMA_API_KEY) {
+          process.env.OLLAMA_API_KEY = "ollama-local";
+        }
+
+        // Set individual config fields to avoid schema validation
+        // requiring a models array when setting the full provider JSON
+        const baseUrlResult = await runCmd(
           OPENCLAW_NODE,
-          clawArgs([
-            "config",
-            "set",
-            "--json",
-            "models.providers.ollama",
-            JSON.stringify(ollamaConfig),
-          ]),
+          clawArgs(["config", "set", "models.providers.ollama.baseUrl", ollamaBaseUrl]),
         );
-        extra += `[config] models.providers.ollama exit=${ollamaResult.code}\n`;
-        if (ollamaResult.output) extra += ollamaResult.output;
+        extra += `[config] models.providers.ollama.baseUrl exit=${baseUrlResult.code}\n`;
+
+        const apiResult = await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["config", "set", "models.providers.ollama.api", "ollama"]),
+        );
+        extra += `[config] models.providers.ollama.api exit=${apiResult.code}\n`;
+
+        const apiKeyResult = await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["config", "set", "models.providers.ollama.apiKey", "ollama-local"]),
+        );
+        extra += `[config] models.providers.ollama.apiKey exit=${apiKeyResult.code}\n`;
       }
 
       async function configureChannel(name, cfgObj) {
