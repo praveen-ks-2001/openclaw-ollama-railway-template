@@ -110,6 +110,43 @@ function isConfigured() {
   }
 }
 
+/**
+ * Repairs broken Ollama provider config in openclaw.json.
+ * If models.providers.ollama exists but has no valid models array,
+ * remove the entry so the gateway can start without validation errors.
+ */
+function repairOllamaConfig() {
+  try {
+    const cfgPath = configPath();
+    if (!fs.existsSync(cfgPath)) return;
+
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    const cfg = JSON.parse(raw);
+
+    const ollama = cfg?.models?.providers?.ollama;
+    if (!ollama) return; // No ollama entry, nothing to repair
+
+    if (!Array.isArray(ollama.models)) {
+      // Broken entry — remove it so gateway can start
+      console.log("[wrapper] repairing broken models.providers.ollama (missing models array)");
+      delete cfg.models.providers.ollama;
+
+      // Clean up empty objects
+      if (Object.keys(cfg.models.providers).length === 0) {
+        delete cfg.models.providers;
+      }
+      if (Object.keys(cfg.models).length === 0) {
+        delete cfg.models;
+      }
+
+      fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+      console.log("[wrapper] removed broken ollama provider entry from config");
+    }
+  } catch (err) {
+    console.warn(`[wrapper] config repair failed: ${err.message}`);
+  }
+}
+
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
@@ -1241,6 +1278,9 @@ const server = app.listen(PORT, () => {
 
   if (isConfigured()) {
     (async () => {
+      // Repair broken Ollama config from previous deployments
+      repairOllamaConfig();
+
       try {
         console.log("[wrapper] running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
