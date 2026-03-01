@@ -142,6 +142,7 @@ function isConfigured() {
 
 let gatewayProc = null;
 let gatewayStarting = null;
+let manualRestart = false; // true while restartGateway() is managing a restart
 let shuttingDown = false;
 
 function sleep(ms) {
@@ -248,10 +249,11 @@ async function startGateway() {
   gatewayProc.on("exit", (code, signal) => {
     console.error(`[gateway] exited code=${code} signal=${signal}`);
     gatewayProc = null;
-    if (!shuttingDown && isConfigured()) {
+    // Skip auto-restart if restartGateway() is managing this restart itself
+    if (!shuttingDown && !manualRestart && isConfigured()) {
       console.log("[gateway] scheduling auto-restart in 2s...");
       setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
+        if (!shuttingDown && !manualRestart && !gatewayProc && isConfigured()) {
           ensureGatewayRunning().catch((err) => {
             console.error(`[gateway] auto-restart failed: ${err.message}`);
           });
@@ -289,13 +291,27 @@ function isGatewayReady() {
 
 async function restartGateway() {
   if (gatewayProc) {
+    // Wait for the process to actually exit before we try to restart.
+    // If we just kill + sleep(750), the exit handler fires too and schedules
+    // its own restart after 2s — two processes then race for port 18789.
+    // Solution: set a flag the exit handler checks, and wait for the real exit event.
+    const proc = gatewayProc;
+    const exitPromise = new Promise((resolve) => proc.once("exit", resolve));
+    manualRestart = true; // suppress auto-restart in the exit handler
     try {
-      gatewayProc.kill("SIGTERM");
+      proc.kill("SIGTERM");
     } catch (err) {
       console.warn(`[gateway] kill error: ${err.message}`);
     }
-    await sleep(750);
-    gatewayProc = null;
+    // Wait up to 5s for clean exit, then SIGKILL
+    const timeout = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+    }, 5000);
+    await exitPromise;
+    clearTimeout(timeout);
+    // Brief pause to let the OS fully release the port
+    await sleep(500);
+    manualRestart = false;
   }
   return ensureGatewayRunning();
 }
@@ -1133,13 +1149,15 @@ app.post("/setup/api/apply-ollama", requireSetupAuth, async (_req, res) => {
   out += `[apply-ollama] verify: ${verify.output?.trim() || "(empty)"}\n`;
 
   if (r1.code === 0) {
-    out += "\n[apply-ollama] Restarting gateway to pick up new config...\n";
-    try {
-      await restartGateway();
-      out += "[apply-ollama] Gateway restarted.\n";
-    } catch (err) {
-      out += `[apply-ollama] Gateway restart failed: ${err.message}\n`;
-    }
+    out += "\n[apply-ollama] Scheduling gateway restart in 1s (fire-and-forget)...\n";
+    // Fire-and-forget: respond to the browser first, THEN restart.
+    // If we await restartGateway() here, the HTTP response may never arrive
+    // because the gateway (which proxies our response) gets killed mid-flight.
+    setTimeout(() => {
+      restartGateway().catch((err) => {
+        console.error(`[apply-ollama] gateway restart error: ${err.message}`);
+      });
+    }, 1000);
   }
 
   return res.status(r1.code === 0 ? 200 : 500).json({ ok: r1.code === 0, output: out });
