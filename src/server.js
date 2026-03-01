@@ -74,11 +74,20 @@ const OPENCLAW_ENTRY =
   process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
-// Ensure OLLAMA_API_KEY is set when OLLAMA_BASE_URL is configured
-// OpenClaw needs OLLAMA_API_KEY to register Ollama as a provider
-if (process.env.OLLAMA_BASE_URL?.trim() && !process.env.OLLAMA_API_KEY) {
-  process.env.OLLAMA_API_KEY = "ollama-local";
-  console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local");
+// When OLLAMA_BASE_URL is configured, set env vars that OpenClaw and
+// the Ollama SDK need at runtime:
+//   OLLAMA_API_KEY  — registers Ollama as a provider
+//   OLLAMA_HOST     — tells all Ollama SDK clients where to connect
+if (process.env.OLLAMA_BASE_URL?.trim()) {
+  const ollamaUrl = process.env.OLLAMA_BASE_URL.trim();
+  if (!process.env.OLLAMA_API_KEY) {
+    process.env.OLLAMA_API_KEY = "ollama-local";
+    console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local");
+  }
+  if (!process.env.OLLAMA_HOST) {
+    process.env.OLLAMA_HOST = ollamaUrl;
+    console.log(`[wrapper] auto-set OLLAMA_HOST=${ollamaUrl}`);
+  }
 }
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
@@ -740,6 +749,32 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
         if (launchResult.code !== 0) {
           extra += `[ollama] Warning: ollama launch exited with code ${launchResult.code}\n`;
+        }
+
+        // Ensure the config's baseUrl points to the remote Ollama server.
+        // `ollama launch openclaw --config` may have written localhost as the baseUrl.
+        try {
+          const cfgPath = configPath();
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+          const ollamaCfg = cfg?.models?.providers?.ollama;
+          if (ollamaCfg) {
+            const needsFix = !ollamaCfg.baseUrl || ollamaCfg.baseUrl.includes("127.0.0.1") || ollamaCfg.baseUrl.includes("localhost");
+            if (needsFix) {
+              ollamaCfg.baseUrl = ollamaBaseUrl;
+              extra += `[config] Fixed ollama baseUrl → ${ollamaBaseUrl}\n`;
+            }
+            // Ensure api is set to "ollama" for native tool-calling
+            if (!ollamaCfg.api) {
+              ollamaCfg.api = "ollama";
+              extra += `[config] Set ollama api → \"ollama\"\n`;
+            }
+            fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+            extra += `[config] Final ollama provider config: baseUrl=${ollamaCfg.baseUrl}, api=${ollamaCfg.api}\n`;
+          } else {
+            extra += `[config] Warning: models.providers.ollama not found in config after ollama launch\n`;
+          }
+        } catch (err) {
+          extra += `[config] Failed to verify/fix ollama config: ${err.message}\n`;
         }
       }
 
