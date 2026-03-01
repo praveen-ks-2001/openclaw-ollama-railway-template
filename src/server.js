@@ -75,7 +75,12 @@ const OPENCLAW_ENTRY =
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
+
+// Ollama integration — set OLLAMA_BASE_URL to point at your Ollama service
+// (e.g. http://ollama.railway.internal:11434 when deployed on Railway)
+// OLLAMA_API_KEY can be any non-empty string; Ollama doesn't validate it.
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL?.trim() || "";
+const OLLAMA_API_KEY  = process.env.OLLAMA_API_KEY?.trim()  || (OLLAMA_BASE_URL ? "ollama-local" : "");
 const TUI_IDLE_TIMEOUT_MS = Number.parseInt(
   process.env.TUI_IDLE_TIMEOUT_MS ?? "300000",
   10,
@@ -450,28 +455,32 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
         { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
       ],
     },
-  ,
     {
       value: "ollama",
       label: "Ollama",
-      hint: "Local / self-hosted",
+      hint: "Local / self-hosted LLM",
       options: [
-        { value: "ollama", label: "Ollama (OpenAI-compatible)" },
+        { value: "ollama", label: "Ollama (native API — best tool calling)" },
       ],
     },
   ];
 
-  // Fetch available Ollama models if OLLAMA_BASE_URL is configured
+  // ── Fetch available Ollama models from /api/tags ──────────────────────────
+  // We query /api/tags (not /v1) — this is Ollama's native endpoint.
+  // The wrapper displays these as a dropdown so the user can pick one.
   let ollamaModels = [];
-  if (OLLAMA_BASE_URL) {
+  const effectiveOllamaUrl = OLLAMA_BASE_URL;
+  if (effectiveOllamaUrl) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      const r = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: controller.signal });
-      clearTimeout(timeout);
+      const tid = setTimeout(() => controller.abort(), 5000);
+      const r = await fetch(`${effectiveOllamaUrl}/api/tags`, { signal: controller.signal });
+      clearTimeout(tid);
       if (r.ok) {
         const data = await r.json();
         ollamaModels = (data.models || []).map((m) => m.name);
+      } else {
+        console.warn(`[ollama] /api/tags returned HTTP ${r.status}`);
       }
     } catch (err) {
       console.warn(`[ollama] failed to fetch models: ${err.message}`);
@@ -485,7 +494,8 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     channelsAddHelp: channelsHelp,
     authGroups,
     tuiEnabled: ENABLE_WEB_TUI,
-    ollamaBaseUrl: OLLAMA_BASE_URL || null,
+    ollamaConfigured: Boolean(effectiveOllamaUrl),
+    ollamaBaseUrl: effectiveOllamaUrl || null,
     ollamaModels,
   });
 });
@@ -531,13 +541,13 @@ function buildOnboardArgs(payload) {
       "opencode-zen": "--opencode-zen-api-key",
     };
 
-    // Ollama uses OpenAI-compatible API - pass the base URL as openai api base
     if (payload.authChoice === "ollama") {
-      const ollamaUrl = (payload.ollamaUrl || process.env.OLLAMA_BASE_URL || "").trim();
-      if (ollamaUrl) {
-        args.push("--openai-api-key", "ollama");
-        args.push("--openai-api-base", `${ollamaUrl}/v1`);
-      }
+      // Ollama uses its own native provider — OpenClaw activates it via
+      // OLLAMA_API_KEY.  We still need to get past the onboarding flow
+      // which requires an --auth-choice the CLI knows; we pass openai-api-key
+      // with a placeholder value so the config file is created, then the
+      // post-onboard steps configure the real Ollama provider.
+      args.push("--openai-api-key", "placeholder-replaced-by-ollama");
     } else {
       const flag = map[payload.authChoice];
       if (flag && secret) {
@@ -604,7 +614,7 @@ if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     "slackAppToken",
     "authSecret",
     "model",
-    "ollamaUrl",
+    "ollamaModel",
   ];
   for (const field of stringFields) {
     if (payload[field] !== undefined && typeof payload[field] !== "string") {
@@ -678,7 +688,47 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       );
       extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
 
-      if (payload.model?.trim()) {
+      // ── Ollama provider post-onboard configuration ───────────────────────
+      if (payload.authChoice === "ollama") {
+        const ollamaUrl = (OLLAMA_BASE_URL || "").trim();
+        const ollamaKey = (OLLAMA_API_KEY || "ollama-local").trim();
+        const ollamaModel = (payload.ollamaModel || payload.model || "").trim();
+
+        extra += `\n[ollama] Configuring native Ollama provider...\n`;
+
+        // Set the API key (any non-empty value works)
+        const r1 = await runCmd(OPENCLAW_NODE, clawArgs([
+          "config", "set", "models.providers.ollama.apiKey", ollamaKey,
+        ]));
+        extra += `[ollama] set apiKey exit=${r1.code}\n`;
+
+        // Set the base URL (no /v1 suffix — native Ollama API)
+        if (ollamaUrl) {
+          const r2 = await runCmd(OPENCLAW_NODE, clawArgs([
+            "config", "set", "models.providers.ollama.baseUrl", ollamaUrl,
+          ]));
+          extra += `[ollama] set baseUrl=${ollamaUrl} exit=${r2.code}\n`;
+        }
+
+        // Explicitly set api: "ollama" so OpenClaw uses the native /api/chat
+        // (not the OpenAI-compat /v1 path, which breaks tool calling)
+        const r3 = await runCmd(OPENCLAW_NODE, clawArgs([
+          "config", "set", "models.providers.ollama.api", "ollama",
+        ]));
+        extra += `[ollama] set api=ollama exit=${r3.code}\n`;
+
+        // Set the model in agents.defaults if provided
+        if (ollamaModel) {
+          const fullModel = ollamaModel.startsWith("ollama/")
+            ? ollamaModel
+            : `ollama/${ollamaModel}`;
+          const r4 = await runCmd(OPENCLAW_NODE, clawArgs([
+            "models", "set", fullModel,
+          ]));
+          extra += `[ollama] set default model=${fullModel} exit=${r4.code}\n${r4.output || ""}`;
+        }
+      } else if (payload.model?.trim()) {
+      // ── Standard model selection ─────────────────────────────────────────
         extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
         const modelResult = await runCmd(
           OPENCLAW_NODE,
