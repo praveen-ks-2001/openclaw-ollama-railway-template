@@ -74,11 +74,18 @@ const OPENCLAW_ENTRY =
   process.env.OPENCLAW_ENTRY?.trim() || "/openclaw/dist/entry.js";
 const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
 
-// Ensure OLLAMA_API_KEY is set when OLLAMA_BASE_URL is configured
-// OpenClaw needs this env var to register Ollama as a provider
-if (process.env.OLLAMA_BASE_URL?.trim() && !process.env.OLLAMA_API_KEY) {
-  process.env.OLLAMA_API_KEY = "ollama-local";
-  console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local (OLLAMA_BASE_URL is configured)");
+// Ensure OLLAMA_API_KEY and OLLAMA_HOST are set when OLLAMA_BASE_URL is configured
+// OpenClaw needs OLLAMA_API_KEY to register Ollama as a provider
+// OLLAMA_HOST tells the Ollama SDK (and OpenClaw's discovery) where to connect
+if (process.env.OLLAMA_BASE_URL?.trim()) {
+  if (!process.env.OLLAMA_API_KEY) {
+    process.env.OLLAMA_API_KEY = "ollama-local";
+    console.log("[wrapper] auto-set OLLAMA_API_KEY=ollama-local");
+  }
+  if (!process.env.OLLAMA_HOST) {
+    process.env.OLLAMA_HOST = process.env.OLLAMA_BASE_URL.trim();
+    console.log(`[wrapper] auto-set OLLAMA_HOST=${process.env.OLLAMA_HOST}`);
+  }
 }
 
 const ENABLE_WEB_TUI = process.env.ENABLE_WEB_TUI?.toLowerCase() === "true";
@@ -673,30 +680,29 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         const ollamaBaseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
         extra += `\n[setup] Configuring Ollama provider (baseUrl=${ollamaBaseUrl})...\n`;
 
-        // Ensure OLLAMA_API_KEY is set for discovery
-        if (!process.env.OLLAMA_API_KEY) {
-          process.env.OLLAMA_API_KEY = "ollama-local";
+        // Ensure env vars are set for child processes
+        process.env.OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "ollama-local";
+        process.env.OLLAMA_HOST = process.env.OLLAMA_HOST || ollamaBaseUrl;
+
+        // Directly edit openclaw.json to inject the Ollama provider config
+        // This bypasses CLI schema validation which incorrectly requires a models array
+        try {
+          const cfgPath = configPath();
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+
+          if (!cfg.models) cfg.models = {};
+          if (!cfg.models.providers) cfg.models.providers = {};
+          cfg.models.providers.ollama = {
+            baseUrl: ollamaBaseUrl,
+            api: "ollama",
+            apiKey: "ollama-local",
+          };
+
+          fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), "utf8");
+          extra += `[config] models.providers.ollama injected into ${cfgPath}\n`;
+        } catch (err) {
+          extra += `[config] Failed to inject Ollama provider: ${err.message}\n`;
         }
-
-        // Set individual config fields to avoid schema validation
-        // requiring a models array when setting the full provider JSON
-        const baseUrlResult = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "set", "models.providers.ollama.baseUrl", ollamaBaseUrl]),
-        );
-        extra += `[config] models.providers.ollama.baseUrl exit=${baseUrlResult.code}\n`;
-
-        const apiResult = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "set", "models.providers.ollama.api", "ollama"]),
-        );
-        extra += `[config] models.providers.ollama.api exit=${apiResult.code}\n`;
-
-        const apiKeyResult = await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "set", "models.providers.ollama.apiKey", "ollama-local"]),
-        );
-        extra += `[config] models.providers.ollama.apiKey exit=${apiKeyResult.code}\n`;
       }
 
       async function configureChannel(name, cfgObj) {
